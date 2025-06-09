@@ -42,8 +42,9 @@ def extract_cv_lod(filepath):
         "Compound_F": {"Cv90": cv90_f, "LOD90": lod90_f}
     }
 
-def classify_samples(df, cv90, lod90):
+def classify_samples(df, cv90, lod90, z):
     threshold = cv90 * lod90
+    #all blanks are negative
     blanks_df = df[df["Concentration\n(ng)"] == 0].reset_index(drop=True)
     non_blanks_df = df[df["Concentration\n(ng)"] != 0].reset_index(drop=True)
 
@@ -118,7 +119,7 @@ def generate_roc_auc_excel_interactive(
                 roc_sheet.write(j+1, i, val)
 
         def add_chart(sheet_name, col_pairs, title, pos):
-            chart = workbook.add_chart({'type': 'line'})
+            chart = workbook.add_chart({'type': 'line'}) # change to scatter plot
             chart.set_title({'name': title})
             chart.set_x_axis({'name': 'False Positive Rate'})
             chart.set_y_axis({'name': 'True Positive Rate', 'min': 0, 'max': 1})
@@ -139,7 +140,7 @@ def generate_roc_auc_excel_interactive(
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
+    #prompt user for z value
     for filename in os.listdir(INPUT_FOLDER):
         if filename.endswith('.xlsx') and not filename.startswith('~$'):
             input_path = os.path.join(INPUT_FOLDER, filename)
@@ -154,9 +155,10 @@ def main():
 
                 blanks_g, non_blanks_g, result_blanks_g, result_non_blanks_g = classify_samples(
                     Compound_G, results["Compound_G"]["Cv90"], results["Compound_G"]["LOD90"]
+                    , z=0.5
                 )
                 blanks_f, non_blanks_f, result_blanks_f, result_non_blanks_f = classify_samples(
-                    Compound_F, results["Compound_F"]["Cv90"], results["Compound_F"]["LOD90"]
+                    Compound_F, results["Compound_F"]["Cv90"], results["Compound_F"]["LOD90"], z = 0.5
                 )
 
                 generate_roc_auc_excel_interactive(
