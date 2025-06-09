@@ -7,7 +7,8 @@ def install(package):
 required_packages = [
     "pandas",
     "scikit-learn",
-    "XlsxWriter"
+    "XlsxWriter",
+    "openpyxl"
 ]
 
 for pkg in required_packages:
