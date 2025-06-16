@@ -1,177 +1,160 @@
 import os
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
-import xlsxwriter
 
 INPUT_FOLDER = "input"
 OUTPUT_FOLDER = "output"
+
 
 def load_and_clean_data(filepath):
     Compound_G = pd.read_excel(
         filepath,
         skiprows=[0, 4],
         nrows=52,
-        usecols="A:G",
-        names=[
-            "Sample ID", "Concentration\n(ng)", "Intensity\n(cps)", "Mass\n(m/z)",
-            "Mass 15 Intensity\n(cps)", "Mass 18 Intensity\n(cps)", "Mass 18 Ratio"
-        ]
-    )
+        usecols="A:C",
+        names=["Sample ID", "Concentration (ng)", "Intensity\n(cps)"]
+    ).dropna().iloc[1:].reset_index(drop=True)
+
     Compound_F = pd.read_excel(
         filepath,
         skiprows=[0, 1],
         nrows=52,
-        usecols="A,H:M",
-        names=[
-            "Sample ID", "Concentration\n(ng)", "Intensity\n(cps)", "Mass\n(m/z)",
-            "Mass 15 Intensity\n(cps)", "Mass 18 Intensity\n(cps)", "Mass 18 Ratio"
-        ]
-    )
-    Compound_G = Compound_G.dropna().iloc[1:].reset_index(drop=True)
-    Compound_F = Compound_F.dropna().iloc[1:].reset_index(drop=True)
+        usecols="A,H:I",
+        names=["Sample ID", "Concentration (ng)", "Intensity\n(cps)"]
+    ).dropna().iloc[1:].reset_index(drop=True)
+
     return Compound_G, Compound_F
 
-def extract_cv_lod(filepath):
-    sheet = pd.read_excel(filepath, sheet_name="Sheet1", header=None)
-    lod90_g = sheet.iloc[0, 2]
-    cv90_g = sheet.iloc[1, 2]
-    lod90_f = sheet.iloc[0, 8]
-    cv90_f = sheet.iloc[1, 8]
+
+def extract_cv_values(filepath):
+    sheet = pd.read_excel(filepath, sheet_name=0, header=None)
+    cv_g = None
+    cv_f = None
+
+    for row in range(sheet.shape[0]):
+        for col in range(sheet.shape[1]):
+            cell = str(sheet.iat[row, col]).strip().lower()
+            if "cv90" in cell:
+                if col == 1:
+                    cv_g = pd.to_numeric(sheet.iat[row, col + 1], errors='coerce')
+                elif col == 7:
+                    cv_f = pd.to_numeric(sheet.iat[row, col + 1], errors='coerce')
+
+    if cv_g is None or cv_f is None:
+        raise ValueError("Cv90 value not found for both compounds. Please check the Excel format.")
+
     return {
-        "Compound_G": {"Cv90": cv90_g, "LOD90": lod90_g},
-        "Compound_F": {"Cv90": cv90_f, "LOD90": lod90_f}
+        "Compound_G": cv_g,
+        "Compound_F": cv_f
     }
 
-def classify_samples(df, cv90, lod90, z):
-    threshold = cv90 * lod90
-    #all blanks are negative
-    blanks_df = df[df["Concentration\n(ng)"] == 0].reset_index(drop=True)
-    non_blanks_df = df[df["Concentration\n(ng)"] != 0].reset_index(drop=True)
 
-    blank_results = blanks_df[["Sample ID", "Intensity\n(cps)"]].copy()
-    blank_results["Above Threshold"] = blanks_df["Intensity\n(cps)"] > threshold
+def classify_samples(df, threshold):
+    conditions = [
+        (df["Concentration (ng)"] != 0) & (df["Intensity\n(cps)"] > threshold),
+        (df["Concentration (ng)"] != 0) & (df["Intensity\n(cps)"] <= threshold),
+        (df["Concentration (ng)"] == 0) & (df["Intensity\n(cps)"] > threshold),
+        (df["Concentration (ng)"] == 0) & (df["Intensity\n(cps)"] <= threshold)
+    ]
+    choices = ['TP', 'FN', 'FP', 'TN']
+    df['Classification'] = np.select(conditions, choices, default='Unknown')
+    df['Above Threshold'] = df['Intensity\n(cps)'] > threshold
+    df['True Label'] = (df['Concentration (ng)'] != 0).astype(int)
 
-    non_blank_results = non_blanks_df[["Sample ID", "Intensity\n(cps)"]].copy()
-    non_blank_results["Above Threshold"] = non_blanks_df["Intensity\n(cps)"] > threshold
+    return df
 
-    return blanks_df, non_blanks_df, blank_results, non_blank_results
 
-# Use previously defined interactive chart function here
-from pathlib import Path
+def add_interactive_roc_chart(workbook, worksheet, fpr_g, tpr_g, fpr_f, tpr_f):
+    roc_sheet = workbook.add_worksheet("ROC_Data")
+    roc_sheet.write(0, 0, "FPR_G")
+    roc_sheet.write(0, 1, "TPR_G")
+    roc_sheet.write(0, 3, "FPR_F")
+    roc_sheet.write(0, 4, "TPR_F")
 
-def generate_roc_auc_excel_interactive(
-    compound_g_blanks, compound_g_non_blanks,
-    compound_f_blanks, compound_f_non_blanks,
-    result_blanks_g, result_non_blanks_g,
-    result_blanks_f, result_non_blanks_f,
-    output_path):
+    for i, (fg, tg) in enumerate(zip(fpr_g, tpr_g)):
+        roc_sheet.write(i + 1, 0, fg)
+        roc_sheet.write(i + 1, 1, tg)
+    for i, (ff, tf) in enumerate(zip(fpr_f, tpr_f)):
+        roc_sheet.write(i + 1, 3, ff)
+        roc_sheet.write(i + 1, 4, tf)
 
-    def compute_roc_auc(blank_df, non_blank_df):
-        y_true = [0] * len(blank_df) + [1] * len(non_blank_df)
-        y_scores = list(blank_df["Intensity\n(cps)"]) + list(non_blank_df["Intensity\n(cps)"])
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        roc_auc = auc(fpr, tpr)
-        return fpr, tpr, roc_auc
-
-    def compute_non_blank_auc(non_blank_df):
-        scores = list(non_blank_df["Intensity\n(cps)"])
-        threshold = pd.Series(scores).quantile(0.2)
-        y_true = [0 if val < threshold else 1 for val in scores]
-        fpr, tpr, _ = roc_curve(y_true, scores)
-        roc_auc = auc(fpr, tpr)
-        return fpr, tpr, roc_auc
-
-    # Compute both types
-    fpr_g_all, tpr_g_all, auc_g_all = compute_roc_auc(compound_g_blanks, compound_g_non_blanks)
-    fpr_f_all, tpr_f_all, auc_f_all = compute_roc_auc(compound_f_blanks, compound_f_non_blanks)
-
-    fpr_g_nb, tpr_g_nb, auc_g_nb = compute_non_blank_auc(compound_g_non_blanks)
-    fpr_f_nb, tpr_f_nb, auc_f_nb = compute_non_blank_auc(compound_f_non_blanks)
-
-    auc_summary = pd.DataFrame({
-        "Compound": ["Compound G", "Compound F"],
-        "AUC (With Blanks)": [auc_g_all, auc_f_all],
-        "AUC (Non-Blanks Only)": [auc_g_nb, auc_f_nb]
+    chart = workbook.add_chart({'type': 'scatter', 'subtype': 'smooth_with_markers'})
+    chart.add_series({
+        'name': 'Compound G',
+        'categories': ['ROC_Data', 1, 0, len(fpr_g), 0],
+        'values': ['ROC_Data', 1, 1, len(tpr_g), 1],
+        'marker': {'type': 'circle'},
+        'line': {'color': 'blue'},
     })
+    chart.add_series({
+        'name': 'Compound F',
+        'categories': ['ROC_Data', 1, 3, len(fpr_f), 3],
+        'values': ['ROC_Data', 1, 4, len(tpr_f), 4],
+        'marker': {'type': 'square'},
+        'line': {'color': 'red'},
+    })
+    chart.set_title({'name': 'ROC Curve'})
+    chart.set_x_axis({'name': 'False Positive Rate'})
+    chart.set_y_axis({'name': 'True Positive Rate'})
+    chart.set_legend({'position': 'bottom'})
 
+    worksheet.insert_chart('G2', chart)
+
+
+def process_file(filepath, z=1.1):
+    basename = os.path.splitext(os.path.basename(filepath))[0]
+    output_path = os.path.join(OUTPUT_FOLDER, f"{basename}_results.xlsx")
+
+    Compound_G, Compound_F = load_and_clean_data(filepath)
+    cv_values = extract_cv_values(filepath)
+
+    threshold_g = cv_values["Compound_G"] * z
+    threshold_f = cv_values["Compound_F"] * z
+
+    Compound_G = classify_samples(Compound_G, threshold_g)
+    Compound_F = classify_samples(Compound_F, threshold_f)
+
+    y_true_g, y_score_g = Compound_G['True Label'], Compound_G['Intensity\n(cps)']
+    y_true_f, y_score_f = Compound_F['True Label'], Compound_F['Intensity\n(cps)']
+
+    fpr_g, tpr_g, thresholds_g = roc_curve(y_true_g, y_score_g)
+    auc_g = auc(fpr_g, tpr_g)
+
+    fpr_f, tpr_f, thresholds_f = roc_curve(y_true_f, y_score_f)
+    auc_f = auc(fpr_f, tpr_f)
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
         workbook = writer.book
+        summary_df = pd.DataFrame({
+            "Compound": ["Compound G", "Compound F"],
+            "Z-Value": [z, z],
+            "Threshold": [threshold_g, threshold_f],
+            "AUC": [auc_g, auc_f],
+            "Min ROC Threshold": [thresholds_g.min(), thresholds_f.min()],
+            "Max ROC Threshold": [thresholds_g.max(), thresholds_f.max()]
+        })
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        worksheet = writer.sheets['Summary']
 
-        # Output result summaries
-        auc_summary.to_excel(writer, sheet_name='Summary', startrow=0, startcol=0, index=False)
-        result_blanks_g.to_excel(writer, sheet_name='Summary', startrow=4, startcol=0, index=False)
-        result_non_blanks_g.to_excel(writer, sheet_name='Summary', startrow=4, startcol=3, index=False)
-        result_blanks_f.to_excel(writer, sheet_name='Summary', startrow=4, startcol=6, index=False)
-        result_non_blanks_f.to_excel(writer, sheet_name='Summary', startrow=4, startcol=9, index=False)
+        add_interactive_roc_chart(workbook, worksheet, fpr_g, tpr_g, fpr_f, tpr_f)
 
-        # Add ROC data for charting
-        roc_sheet = workbook.add_worksheet("ROC_Data")
-        writer.sheets["ROC_Data"] = roc_sheet
-        headers = [
-            ("FPR_G_All", fpr_g_all), ("TPR_G_All", tpr_g_all),
-            ("FPR_F_All", fpr_f_all), ("TPR_F_All", tpr_f_all),
-            ("FPR_G_NB", fpr_g_nb), ("TPR_G_NB", tpr_g_nb),
-            ("FPR_F_NB", fpr_f_nb), ("TPR_F_NB", tpr_f_nb),
-        ]
-        for i, (label, data) in enumerate(headers):
-            roc_sheet.write(0, i, label)
-            for j, val in enumerate(data):
-                roc_sheet.write(j+1, i, val)
+        columns_to_export = ["Sample ID", "Concentration (ng)", "Intensity\n(cps)", "Above Threshold", "Classification"]
+        Compound_G[columns_to_export].to_excel(writer, sheet_name="Compound_G", index=False)
+        Compound_F[columns_to_export].to_excel(writer, sheet_name="Compound_F", index=False)
 
-        def add_chart(sheet_name, col_pairs, title, pos):
-            chart = workbook.add_chart({'type': 'line'}) # change to scatter plot
-            chart.set_title({'name': title})
-            chart.set_x_axis({'name': 'False Positive Rate'})
-            chart.set_y_axis({'name': 'True Positive Rate', 'min': 0, 'max': 1})
-            chart.set_legend({'position': 'bottom'})
-            colors = ['blue', 'red']
-            labels = ['Compound G', 'Compound F']
-            for i, (x_col, y_col) in enumerate(col_pairs):
-                chart.add_series({
-                    'name': labels[i],
-                    'categories': ['ROC_Data', 1, x_col, len(fpr_g_all), x_col],
-                    'values':     ['ROC_Data', 1, y_col, len(fpr_g_all), y_col],
-                    'line':       {'color': colors[i]},
-                })
-            writer.sheets[sheet_name].insert_chart(pos, chart)
+    print(f"✅ Results written to {output_path}")
 
-        add_chart('Summary', [(0, 1), (2, 3)], "ROC (with blanks)", 'M2')
-        add_chart('Summary', [(4, 5), (6, 7)], "ROC (non-blanks only)", 'M20')
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    #prompt user for z value
-    for filename in os.listdir(INPUT_FOLDER):
-        if filename.endswith('.xlsx') and not filename.startswith('~$'):
-            input_path = os.path.join(INPUT_FOLDER, filename)
-            output_file = os.path.splitext(filename)[0] + "_results.xlsx"
-            output_path = os.path.join(OUTPUT_FOLDER, output_file)
+    for file in os.listdir(INPUT_FOLDER):
+        if file.endswith(".xlsx") and not file.startswith('~$'):
+            print(f"Processing {file}...")
+            process_file(os.path.join(INPUT_FOLDER, file), z=1.1)
 
-            print(f"🔄 Processing {filename}...")
-
-            try:
-                Compound_G, Compound_F = load_and_clean_data(input_path)
-                results = extract_cv_lod(input_path)
-
-                blanks_g, non_blanks_g, result_blanks_g, result_non_blanks_g = classify_samples(
-                    Compound_G, results["Compound_G"]["Cv90"], results["Compound_G"]["LOD90"]
-                    , z=0.5
-                )
-                blanks_f, non_blanks_f, result_blanks_f, result_non_blanks_f = classify_samples(
-                    Compound_F, results["Compound_F"]["Cv90"], results["Compound_F"]["LOD90"], z = 0.5
-                )
-
-                generate_roc_auc_excel_interactive(
-                    blanks_g, non_blanks_g, blanks_f, non_blanks_f,
-                    result_blanks_g, result_non_blanks_g,
-                    result_blanks_f, result_non_blanks_f,
-                    output_path
-                )
-
-                print(f"✅ Saved to: {output_path}")
-
-            except Exception as e:
-                print(f"❌ Error processing {filename}: {e}")
 
 if __name__ == "__main__":
     main()
