@@ -22,7 +22,7 @@ def load_and_clean_data(filepath):
     Compound_F = Compound_F.dropna().iloc[1:].reset_index(drop=True)
     return Compound_G, Compound_F
 
-def extract_cv_lod(filepath):
+def extract_cv(filepath):
     sheet = pd.read_excel(filepath, sheet_name="Sheet1", header=None)
     return {
         "Compound_G": {"Cv90": sheet.iloc[1, 2]},
@@ -32,23 +32,27 @@ def extract_cv_lod(filepath):
 def classify_samples_whole(df, cv90, z):
     threshold = cv90 * z
     results = df[["Sample ID", "Concentration\n(ng)", "Intensity\n(cps)"]].copy()
+    results.insert(1, "Concentration (ng)", results.pop("Concentration\n(ng)"))  # Reorder
     results["Above Threshold"] = df["Intensity\n(cps)"] > threshold
-    results["True Label"] = (df["Concentration\n(ng)"] != 0).astype(int)
-    return results
+    results["True Label"] = (results["Concentration (ng)"] != 0).astype(int)
+    return results, threshold
 
-def generate_auc_plot_image(results_df, compound_name, output_dir="output"):
+def generate_auc_plot_image(results_df, compound_name, z, threshold, output_dir="output"):
     y_true = results_df["True Label"]
     y_scores = results_df["Intensity\n(cps)"]
 
-    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
     roc_auc = auc(fpr, tpr)
 
+    min_thresh = np.min(thresholds)
+    max_thresh = np.max(thresholds)
+
     plt.figure(figsize=(6, 6))
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'AUC = {roc_auc:.2f}')
     plt.plot([0, 1], [0, 1], color='navy', linestyle='--', lw=1)
     plt.xlabel('False Positive Rate')
     plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curve for {compound_name}')
+    plt.title(f'ROC Curve for {compound_name} (z={z})')
     plt.legend(loc='lower right')
     plt.grid(True)
 
@@ -56,37 +60,50 @@ def generate_auc_plot_image(results_df, compound_name, output_dir="output"):
     image_path = os.path.join(output_dir, f"{compound_name}_roc_curve.png")
     plt.savefig(image_path)
     plt.close()
-    return image_path
+
+    return image_path, roc_auc, min_thresh, max_thresh
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-    # Uncomment below for real user input
-    # try:
-    #     z = float(input("Enter the z value to use for threshold calculation (e.g. 1.1): "))
-    # except ValueError:
-    #     print("❌ Invalid input for z. Please enter a numeric value.")
-    #     return
-
-    z = 1.1  # fallback for environments without input()
+    z = 1.1  # fixed for test
 
     for filename in os.listdir(INPUT_FOLDER):
         if filename.endswith('.xlsx') and not filename.startswith('~$'):
             input_path = os.path.join(INPUT_FOLDER, filename)
+            output_file = os.path.splitext(filename)[0] + "_results.xlsx"
+            output_path = os.path.join(OUTPUT_FOLDER, output_file)
 
             print(f"🔄 Processing {filename}...")
 
             try:
                 Compound_G, Compound_F = load_and_clean_data(input_path)
-                results = extract_cv_lod(input_path)
+                cv_values = extract_cv(input_path)
 
-                results_g = classify_samples_whole(Compound_G, results["Compound_G"]["Cv90"], z)
-                results_f = classify_samples_whole(Compound_F, results["Compound_F"]["Cv90"], z)
+                results_g, threshold_g = classify_samples_whole(Compound_G, cv_values["Compound_G"]["Cv90"], z)
+                results_f, threshold_f = classify_samples_whole(Compound_F, cv_values["Compound_F"]["Cv90"], z)
 
-                generate_auc_plot_image(results_g, "Compound_G", OUTPUT_FOLDER)
-                generate_auc_plot_image(results_f, "Compound_F", OUTPUT_FOLDER)
+                image_g, auc_g, min_thresh_g, max_thresh_g = generate_auc_plot_image(
+                    results_g, "Compound_G", z, threshold_g, OUTPUT_FOLDER
+                )
+                image_f, auc_f, min_thresh_f, max_thresh_f = generate_auc_plot_image(
+                    results_f, "Compound_F", z, threshold_f, OUTPUT_FOLDER
+                )
 
-                print(f"✅ Saved plots for: {filename}")
+                with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+                    results_g.to_excel(writer, sheet_name="Compound G", index=False)
+                    results_f.to_excel(writer, sheet_name="Compound F", index=False)
+
+                    summary = pd.DataFrame({
+                        "Compound": ["Compound G", "Compound F"],
+                        "Z Value": [z, z],
+                        "Threshold": [threshold_g, threshold_f],
+                        "AUC": [auc_g, auc_f],
+                        "Min ROC Threshold": [min_thresh_g, min_thresh_f],
+                        "Max ROC Threshold": [max_thresh_g, max_thresh_f]
+                    })
+                    summary.to_excel(writer, sheet_name="Summary", index=False)
+
+                print(f"✅ Saved to: {output_path}")
 
             except Exception as e:
                 print(f"❌ Error processing {filename}: {e}")
