@@ -1,160 +1,88 @@
 import os
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import roc_curve
+import xlsxwriter
 
-INPUT_FOLDER = "input"
-OUTPUT_FOLDER = "output"
-
+INPUT_FOLDER, OUTPUT_FOLDER = "input", "output"
 
 def load_and_clean_data(filepath):
-    Compound_G = pd.read_excel(
-        filepath,
-        skiprows=[0, 4],
-        nrows=52,
-        usecols="A:C",
-        names=["Sample ID", "Concentration (ng)", "Intensity\n(cps)"]
-    ).dropna().iloc[1:].reset_index(drop=True)
+    # Returns a dict: {"G": df, "F": df}
+    def read(cols, skips): return pd.read_excel(filepath, skiprows=skips, nrows=52, usecols=cols, names=["Sample ID", "Concentration (ng)", "Intensity (cps)", "Mass (m/z)", "Mass 15 Intensity (cps)", "Mass 18 Intensity (cps)", "Mass 18 Ratio"])
+    dfg = read("A:G", [0,4])
+    dff = read("A,H:M", [0,1])
+    for df in [dfg, dff]:
+        df["Concentration (ng)"] = pd.to_numeric(df["Concentration (ng)"], errors="coerce")
+        df["Intensity (cps)"] = pd.to_numeric(df["Intensity (cps)"], errors="coerce")
+    return { "G": dfg.dropna().iloc[1:].reset_index(drop=True), "F": dff.dropna().iloc[1:].reset_index(drop=True) }
 
-    Compound_F = pd.read_excel(
-        filepath,
-        skiprows=[0, 1],
-        nrows=52,
-        usecols="A,H:I",
-        names=["Sample ID", "Concentration (ng)", "Intensity\n(cps)"]
-    ).dropna().iloc[1:].reset_index(drop=True)
+def extract_cv(filepath): 
+    s = pd.read_excel(filepath, sheet_name="Sheet1", header=None)
+    return { "G": s.iloc[1,2], "F": s.iloc[1,8] }
 
-    return Compound_G, Compound_F
-
-
-def extract_cv_values(filepath):
-    sheet = pd.read_excel(filepath, sheet_name=0, header=None)
-    cv_g = None
-    cv_f = None
-
-    for row in range(sheet.shape[0]):
-        for col in range(sheet.shape[1]):
-            cell = str(sheet.iat[row, col]).strip().lower()
-            if "cv90" in cell:
-                if col == 1:
-                    cv_g = pd.to_numeric(sheet.iat[row, col + 1], errors='coerce')
-                elif col == 7:
-                    cv_f = pd.to_numeric(sheet.iat[row, col + 1], errors='coerce')
-
-    if cv_g is None or cv_f is None:
-        raise ValueError("Cv90 value not found for both compounds. Please check the Excel format.")
-
-    return {
-        "Compound_G": cv_g,
-        "Compound_F": cv_f
-    }
-
-
-def classify_samples(df, threshold):
-    conditions = [
-        (df["Concentration (ng)"] != 0) & (df["Intensity\n(cps)"] > threshold),
-        (df["Concentration (ng)"] != 0) & (df["Intensity\n(cps)"] <= threshold),
-        (df["Concentration (ng)"] == 0) & (df["Intensity\n(cps)"] > threshold),
-        (df["Concentration (ng)"] == 0) & (df["Intensity\n(cps)"] <= threshold)
-    ]
-    choices = ['TP', 'FN', 'FP', 'TN']
-    df['Classification'] = np.select(conditions, choices, default='Unknown')
-    df['Above Threshold'] = df['Intensity\n(cps)'] > threshold
-    df['True Label'] = (df['Concentration (ng)'] != 0).astype(int)
-
+def classify(df, cv, z):
+    t = cv*z
+    def lab(row):
+        if row["Concentration (ng)"] != 0:
+            return "True Positive" if row["Intensity (cps)"] > t else "False Negative"
+        return "False Positive" if row["Intensity (cps)"] > t else "True Negative"
+    df = df.copy()
+    df["Classification"] = df.apply(lab, axis=1)
+    df["True Label"] = df["Classification"].isin(["True Positive","False Negative"]).astype(int)
+    df["Above Threshold"] = df["Classification"].isin(["True Positive","False Positive"]).astype(int)
     return df
 
+def count(df, p): v = df['Classification'].value_counts(); return {f"{p} {k}":v.get(k,0) for k in ["True Positive","False Positive","False Negative","True Negative"]}
 
-def add_interactive_roc_chart(workbook, worksheet, fpr_g, tpr_g, fpr_f, tpr_f):
-    roc_sheet = workbook.add_worksheet("ROC_Data")
-    roc_sheet.write(0, 0, "FPR_G")
-    roc_sheet.write(0, 1, "TPR_G")
-    roc_sheet.write(0, 3, "FPR_F")
-    roc_sheet.write(0, 4, "TPR_F")
+def add_roc(workbook, worksheet, fprg, tprg, fprf, tprf, cg, cf, cvg, cvf, z):
+    sheet = workbook.add_worksheet("ROC Data")
+    gf, ff = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2'}), workbook.add_format({'bold': True, 'bg_color': '#FCE4D6'})
+    sheet.write_row(0,0,["False Positive Rate (Channel G)","True Positive Rate (Channel G)","","False Positive Rate (Channel F)","True Positive Rate (Channel F)"],gf)
+    [sheet.write(i+1,0,fg) or sheet.write(i+1,1,tg) for i,(fg,tg) in enumerate(zip(fprg,tprg))]
+    [sheet.write(i+1,3,ffv) or sheet.write(i+1,4,tfv) for i,(ffv,tfv) in enumerate(zip(fprf,tprf))]
+    sheet.write(0,6,"Confusion Matrix",workbook.add_format({'bold':True}))
+    sheet.write_row(1,6,["Channel","True Positive","False Positive","False Negative","True Negative"],workbook.add_format({'bold':True}))
+    sheet.write_row(2,6,["Channel G",cg.get("G True Positive",0),cg.get("G False Positive",0),cg.get("G False Negative",0),cg.get("G True Negative",0)],gf)
+    sheet.write_row(3,6,["Channel F",cf.get("F True Positive",0),cf.get("F False Positive",0),cf.get("F False Negative",0),cf.get("F True Negative",0)],ff)
+    sheet.write(5,6,"Z Value",workbook.add_format({'bold':True})); sheet.write(5,7,z)
+    sheet.write(6,6,"Critical Value (Channel G)",gf); sheet.write(6,7,cvg)
+    sheet.write(7,6,"Critical Value (Channel F)",ff); sheet.write(7,7,cvf)
+    sheet.set_column(0,10,25)
+    chart = workbook.add_chart({'type':'scatter','subtype':'smooth_with_markers'})
+    chart.add_series({'name':'Channel G','categories':['ROC Data',1,0,len(fprg),0],'values':['ROC Data',1,1,len(tprg),1],'marker':{'type':'circle'},'line':{'color':'blue'}})
+    chart.add_series({'name':'Channel F','categories':['ROC Data',1,3,len(fprf),3],'values':['ROC Data',1,4,len(tprf),4],'marker':{'type':'square'},'line':{'color':'red'}})
+    chart.set_title({'name':'ROC Curve'}); chart.set_x_axis({'name':'False Positive Rate'}); chart.set_y_axis({'name':'True Positive Rate'}); chart.set_legend({'position':'bottom'})
+    worksheet.insert_chart('G2',chart)
 
-    for i, (fg, tg) in enumerate(zip(fpr_g, tpr_g)):
-        roc_sheet.write(i + 1, 0, fg)
-        roc_sheet.write(i + 1, 1, tg)
-    for i, (ff, tf) in enumerate(zip(fpr_f, tpr_f)):
-        roc_sheet.write(i + 1, 3, ff)
-        roc_sheet.write(i + 1, 4, tf)
-
-    chart = workbook.add_chart({'type': 'scatter', 'subtype': 'smooth_with_markers'})
-    chart.add_series({
-        'name': 'Compound G',
-        'categories': ['ROC_Data', 1, 0, len(fpr_g), 0],
-        'values': ['ROC_Data', 1, 1, len(tpr_g), 1],
-        'marker': {'type': 'circle'},
-        'line': {'color': 'blue'},
-    })
-    chart.add_series({
-        'name': 'Compound F',
-        'categories': ['ROC_Data', 1, 3, len(fpr_f), 3],
-        'values': ['ROC_Data', 1, 4, len(tpr_f), 4],
-        'marker': {'type': 'square'},
-        'line': {'color': 'red'},
-    })
-    chart.set_title({'name': 'ROC Curve'})
-    chart.set_x_axis({'name': 'False Positive Rate'})
-    chart.set_y_axis({'name': 'True Positive Rate'})
-    chart.set_legend({'position': 'bottom'})
-
-    worksheet.insert_chart('G2', chart)
-
-
-def process_file(filepath, z=1.1):
-    basename = os.path.splitext(os.path.basename(filepath))[0]
-    output_path = os.path.join(OUTPUT_FOLDER, f"{basename}_results.xlsx")
-
-    Compound_G, Compound_F = load_and_clean_data(filepath)
-    cv_values = extract_cv_values(filepath)
-
-    threshold_g = cv_values["Compound_G"] * z
-    threshold_f = cv_values["Compound_F"] * z
-
-    Compound_G = classify_samples(Compound_G, threshold_g)
-    Compound_F = classify_samples(Compound_F, threshold_f)
-
-    y_true_g, y_score_g = Compound_G['True Label'], Compound_G['Intensity\n(cps)']
-    y_true_f, y_score_f = Compound_F['True Label'], Compound_F['Intensity\n(cps)']
-
-    fpr_g, tpr_g, thresholds_g = roc_curve(y_true_g, y_score_g)
-    auc_g = auc(fpr_g, tpr_g)
-
-    fpr_f, tpr_f, thresholds_f = roc_curve(y_true_f, y_score_f)
-    auc_f = auc(fpr_f, tpr_f)
-
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
-        workbook = writer.book
-        summary_df = pd.DataFrame({
-            "Compound": ["Compound G", "Compound F"],
-            "Z-Value": [z, z],
-            "Threshold": [threshold_g, threshold_f],
-            "AUC": [auc_g, auc_f],
-            "Min ROC Threshold": [thresholds_g.min(), thresholds_f.min()],
-            "Max ROC Threshold": [thresholds_g.max(), thresholds_f.max()]
-        })
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        worksheet = writer.sheets['Summary']
-
-        add_interactive_roc_chart(workbook, worksheet, fpr_g, tpr_g, fpr_f, tpr_f)
-
-        columns_to_export = ["Sample ID", "Concentration (ng)", "Intensity\n(cps)", "Above Threshold", "Classification"]
-        Compound_G[columns_to_export].to_excel(writer, sheet_name="Compound_G", index=False)
-        Compound_F[columns_to_export].to_excel(writer, sheet_name="Compound_F", index=False)
-
-    print(f"✅ Results written to {output_path}")
-
+def process_file(filepath, z):
+    d = load_and_clean_data(filepath); cv = extract_cv(filepath)
+    ch = {k: classify(d[k], cv[k], z) for k in ["G","F"]}
+    cg, cf = count(ch["G"],"G"), count(ch["F"],"F")
+    fprg, tprg, _ = roc_curve(ch["G"]["True Label"], ch["G"]["Intensity (cps)"])
+    fprf, tprf, _ = roc_curve(ch["F"]["True Label"], ch["F"]["Intensity (cps)"])
+    fn = os.path.splitext(os.path.basename(filepath))[0]+"_results.xlsx"; out = os.path.join(OUTPUT_FOLDER, fn)
+    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+        wb = writer.book; ws = wb.add_worksheet("Combined"); writer.sheets['Combined'] = ws
+        gf, ff = wb.add_format({'bold':True,'bg_color':'#D9E1F2'}), wb.add_format({'bold':True,'bg_color':'#FCE4D6'})
+        ws.write(0,0,"Channel G",gf); ws.write(0,len(ch["G"].columns)+2,"Channel F",ff)
+        for k,df,fmt,ofs in zip(["G","F"],[ch["G"],ch["F"]],[gf,ff],[0,len(ch["G"].columns)+2]):
+            [ws.write(1,ofs+c,col,fmt) for c,col in enumerate(df.columns)]
+            for r,row in df.iterrows():
+                [ws.write(r+2,ofs+c,v) for c,v in enumerate(row)]
+        ws.set_column(0, len(ch["G"].columns)+len(ch["F"].columns)+2, 22)
+        base = max(len(ch["G"]),len(ch["F"]))+4
+        for i,(label,val) in enumerate(cg.items()):
+            ws.write(base+i,0,label,gf); ws.write(base+i,1,val)
+        for i,(label,val) in enumerate(cf.items()):
+            ws.write(base+i,len(ch["G"].columns)+2,label,ff); ws.write(base+i,len(ch["G"].columns)+3,val)
+        add_roc(wb, ws, fprg, tprg, fprf, tprf, cg, cf, cv["G"], cv["F"], z)
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    z = 100  # Set for your test
     for file in os.listdir(INPUT_FOLDER):
-        if file.endswith(".xlsx") and not file.startswith('~$'):
+        if file.endswith(".xlsx") and not file.startswith("~$"):
             print(f"Processing {file}...")
-            process_file(os.path.join(INPUT_FOLDER, file), z=1.1)
-
+            process_file(os.path.join(INPUT_FOLDER, file), z=z)
 
 if __name__ == "__main__":
     main()
