@@ -1,0 +1,53 @@
+import pandas as pd
+import numpy as np
+import os
+
+def make_channel(name, blank_int, sample_int, sample_conc, N_blanks=5, N_samples=5):
+    blanks = {
+        "Sample ID": [f"{name}_Blank_{i+1}" for i in range(N_blanks)],
+        "Concentration (ng)": [0]*N_blanks,
+        "Intensity (cps)": [blank_int]*N_blanks,
+        "Mass (m/z)": [10]*N_blanks,
+        "Mass 15 Intensity (cps)": [0]*N_blanks,
+        "Mass 18 Intensity (cps)": [0]*N_blanks,
+        "Mass 18 Ratio": [0]*N_blanks,
+    }
+    samples = {
+        "Sample ID": [f"{name}_Sample_{i+1}" for i in range(N_samples)],
+        "Concentration (ng)": [sample_conc]*N_samples,
+        "Intensity (cps)": [sample_int]*N_samples,
+        "Mass (m/z)": [10]*N_samples,
+        "Mass 15 Intensity (cps)": [0]*N_samples,
+        "Mass 18 Intensity (cps)": [0]*N_samples,
+        "Mass 18 Ratio": [0]*N_samples,
+    }
+    return pd.concat([pd.DataFrame(blanks), pd.DataFrame(samples)], ignore_index=True)
+
+# Channel definitions: (name, blank_int, sample_int, sample_conc, Cv90)
+channels = [
+    ("G", 100, 400, 1, 3.0),
+    ("F", 120, 420, 2, 2.9),
+    ("H", 80, 380, 5, 2.5),
+    ("I", 110, 410, 10, 4.0)
+]
+
+# Make per-channel dataframes
+dfs = [make_channel(*c[:4]) for c in channels]
+full_data = pd.concat(dfs, axis=1)
+
+# Compose Cv90 row for the whole sheet (put Cv90 at col 2, 9, 16, 23, etc.)
+n_channels = len(channels)
+n_cols = n_channels * 7
+cv90_row = [""] * n_cols
+for i, (_, _, _, _, cv90) in enumerate(channels):
+    cv90_row[i*7 + 2] = cv90  # Cv90 goes in 3rd col of each block
+
+header_data = [
+    [""]*n_cols,    # row 0 (blank)
+    cv90_row        # row 1 (Cv90s)
+]
+
+os.makedirs("input", exist_ok=True)
+with pd.ExcelWriter("input/mock_4channel_test.xlsx") as writer:
+    pd.DataFrame(header_data).to_excel(writer, header=False, index=False, startrow=0)
+    full_data.to_excel(writer, header=True, index=False, startrow=5)

@@ -3,86 +3,138 @@ import pandas as pd
 from sklearn.metrics import roc_curve
 import xlsxwriter
 
-INPUT_FOLDER, OUTPUT_FOLDER = "input", "output"
+INPUT_FOLDER = "input"
+OUTPUT_FOLDER = "output"
 
-def load_and_clean_data(filepath):
-    # Returns a dict: {"G": df, "F": df}
-    def read(cols, skips): return pd.read_excel(filepath, skiprows=skips, nrows=52, usecols=cols, names=["Sample ID", "Concentration (ng)", "Intensity (cps)", "Mass (m/z)", "Mass 15 Intensity (cps)", "Mass 18 Intensity (cps)", "Mass 18 Ratio"])
-    dfg = read("A:G", [0,4])
-    dff = read("A,H:M", [0,1])
-    for df in [dfg, dff]:
+def num2col(n):
+    s = ''
+    while True:
+        n, r = divmod(n, 26)
+        s = chr(65 + r) + s
+        if n == 0:
+            break
+        n -= 1
+    return s
+
+def autodetect_channels(sheetpath):
+    tmp = pd.read_excel(sheetpath, header=None, nrows=6)
+    header_row = tmp.iloc[5]
+    n_cols = header_row.last_valid_index() + 1
+
+    channels = []
+    col_start, channel_idx = 0, 1
+
+    while col_start < n_cols:
+        end_col = min(col_start + 6, n_cols - 1)
+        if (end_col - col_start) < 6:
+            break  # Ignore incomplete channels at the end
+        cols = f"{num2col(col_start)}:{num2col(end_col)}"
+        skiprows = [0, 4] if channel_idx == 1 else [0, 1]
+        channels.append((f"Channel {channel_idx}", skiprows, cols, col_start + 2))
+        col_start += 7
+        channel_idx += 1
+
+    return channels
+
+def load_and_clean_data(filepath, channels):
+    dfs = {}
+    for name, skip, cols, _ in channels:
+        df = pd.read_excel(filepath, skiprows=skip, usecols=cols, names=[
+            "Sample ID", "Concentration (ng)", "Intensity (cps)", "Mass (m/z)",
+            "Mass 15 Intensity (cps)", "Mass 18 Intensity (cps)", "Mass 18 Ratio"
+        ])
         df["Concentration (ng)"] = pd.to_numeric(df["Concentration (ng)"], errors="coerce")
         df["Intensity (cps)"] = pd.to_numeric(df["Intensity (cps)"], errors="coerce")
-    return { "G": dfg.dropna().iloc[1:].reset_index(drop=True), "F": dff.dropna().iloc[1:].reset_index(drop=True) }
+        dfs[name] = df.dropna(subset=["Sample ID", "Concentration (ng)", "Intensity (cps)"]).iloc[1:].reset_index(drop=True)
+    return dfs
 
-def extract_cv(filepath): 
-    s = pd.read_excel(filepath, sheet_name="Sheet1", header=None)
-    return { "G": s.iloc[1,2], "F": s.iloc[1,8] }
+def extract_cv(filepath, channels):
+    s = pd.read_excel(filepath, sheet_name=0, header=None)
+    return {name: s.iloc[1, cv_col] for name, _, _, cv_col in channels}
 
 def classify(df, cv, z):
-    t = cv*z
-    def lab(row):
+    threshold = cv * z
+    def label(row):
         if row["Concentration (ng)"] != 0:
-            return "True Positive" if row["Intensity (cps)"] > t else "False Negative"
-        return "False Positive" if row["Intensity (cps)"] > t else "True Negative"
+            return "True Positive" if row["Intensity (cps)"] > threshold else "False Negative"
+        else:
+            return "False Positive" if row["Intensity (cps)"] > threshold else "True Negative"
     df = df.copy()
-    df["Classification"] = df.apply(lab, axis=1)
-    df["True Label"] = df["Classification"].isin(["True Positive","False Negative"]).astype(int)
-    df["Above Threshold"] = df["Classification"].isin(["True Positive","False Positive"]).astype(int)
+    df["Classification"] = df.apply(label, axis=1)
+    df["True Label"] = df["Classification"].isin(["True Positive", "False Negative"]).astype(int)
     return df
 
-def count(df, p): v = df['Classification'].value_counts(); return {f"{p} {k}":v.get(k,0) for k in ["True Positive","False Positive","False Negative","True Negative"]}
+def count(df, prefix):
+    vals = df['Classification'].value_counts()
+    return {f"{prefix} {k}": vals.get(k, 0) for k in ["True Positive", "False Positive", "False Negative", "True Negative"]}
 
-def add_roc(workbook, worksheet, fprg, tprg, fprf, tprf, cg, cf, cvg, cvf, z):
-    sheet = workbook.add_worksheet("ROC Data")
-    gf, ff = workbook.add_format({'bold': True, 'bg_color': '#D9E1F2'}), workbook.add_format({'bold': True, 'bg_color': '#FCE4D6'})
-    sheet.write_row(0,0,["False Positive Rate (Channel G)","True Positive Rate (Channel G)","","False Positive Rate (Channel F)","True Positive Rate (Channel F)"],gf)
-    [sheet.write(i+1,0,fg) or sheet.write(i+1,1,tg) for i,(fg,tg) in enumerate(zip(fprg,tprg))]
-    [sheet.write(i+1,3,ffv) or sheet.write(i+1,4,tfv) for i,(ffv,tfv) in enumerate(zip(fprf,tprf))]
-    sheet.write(0,6,"Confusion Matrix",workbook.add_format({'bold':True}))
-    sheet.write_row(1,6,["Channel","True Positive","False Positive","False Negative","True Negative"],workbook.add_format({'bold':True}))
-    sheet.write_row(2,6,["Channel G",cg.get("G True Positive",0),cg.get("G False Positive",0),cg.get("G False Negative",0),cg.get("G True Negative",0)],gf)
-    sheet.write_row(3,6,["Channel F",cf.get("F True Positive",0),cf.get("F False Positive",0),cf.get("F False Negative",0),cf.get("F True Negative",0)],ff)
-    sheet.write(5,6,"Z Value",workbook.add_format({'bold':True})); sheet.write(5,7,z)
-    sheet.write(6,6,"Critical Value (Channel G)",gf); sheet.write(6,7,cvg)
-    sheet.write(7,6,"Critical Value (Channel F)",ff); sheet.write(7,7,cvf)
-    sheet.set_column(0,10,25)
-    chart = workbook.add_chart({'type':'scatter','subtype':'smooth_with_markers'})
-    chart.add_series({'name':'Channel G','categories':['ROC Data',1,0,len(fprg),0],'values':['ROC Data',1,1,len(tprg),1],'marker':{'type':'circle'},'line':{'color':'blue'}})
-    chart.add_series({'name':'Channel F','categories':['ROC Data',1,3,len(fprf),3],'values':['ROC Data',1,4,len(tprf),4],'marker':{'type':'square'},'line':{'color':'red'}})
-    chart.set_title({'name':'ROC Curve'}); chart.set_x_axis({'name':'False Positive Rate'}); chart.set_y_axis({'name':'True Positive Rate'}); chart.set_legend({'position':'bottom'})
-    worksheet.insert_chart('G2',chart)
+def add_roc(workbook, worksheet, rocs, counts, cvs, z, channel_names):
+    roc_sheet = workbook.add_worksheet("ROC Data")
+    colors = ['blue', 'red', 'green', 'orange', 'purple', 'cyan', 'magenta', 'brown']
+
+    for idx, name in enumerate(channel_names):
+        roc_sheet.write(0, idx*2, f"FPR ({name})")
+        roc_sheet.write(0, idx*2+1, f"TPR ({name})")
+        fpr, tpr = rocs[name]
+        for i, (f, t) in enumerate(zip(fpr, tpr)):
+            roc_sheet.write(i+1, idx*2, f)
+            roc_sheet.write(i+1, idx*2+1, t)
+
+    chart = workbook.add_chart({'type':'scatter', 'subtype':'smooth'})
+    for i, name in enumerate(channel_names):
+        fpr, tpr = rocs[name]
+        chart.add_series({
+            'name': name,
+            'categories': ['ROC Data', 1, i*2, len(fpr), i*2],
+            'values': ['ROC Data', 1, i*2+1, len(tpr), i*2+1],
+            'line': {'color': colors[i % len(colors)]}
+        })
+    chart.set_x_axis({'name': 'False Positive Rate'})
+    chart.set_y_axis({'name': 'True Positive Rate'})
+    worksheet.insert_chart('B10', chart)
 
 def process_file(filepath, z):
-    d = load_and_clean_data(filepath); cv = extract_cv(filepath)
-    ch = {k: classify(d[k], cv[k], z) for k in ["G","F"]}
-    cg, cf = count(ch["G"],"G"), count(ch["F"],"F")
-    fprg, tprg, _ = roc_curve(ch["G"]["True Label"], ch["G"]["Intensity (cps)"])
-    fprf, tprf, _ = roc_curve(ch["F"]["True Label"], ch["F"]["Intensity (cps)"])
-    fn = os.path.splitext(os.path.basename(filepath))[0]+"_results.xlsx"; out = os.path.join(OUTPUT_FOLDER, fn)
-    with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-        wb = writer.book; ws = wb.add_worksheet("Combined"); writer.sheets['Combined'] = ws
-        gf, ff = wb.add_format({'bold':True,'bg_color':'#D9E1F2'}), wb.add_format({'bold':True,'bg_color':'#FCE4D6'})
-        ws.write(0,0,"Channel G",gf); ws.write(0,len(ch["G"].columns)+2,"Channel F",ff)
-        for k,df,fmt,ofs in zip(["G","F"],[ch["G"],ch["F"]],[gf,ff],[0,len(ch["G"].columns)+2]):
-            [ws.write(1,ofs+c,col,fmt) for c,col in enumerate(df.columns)]
-            for r,row in df.iterrows():
-                [ws.write(r+2,ofs+c,v) for c,v in enumerate(row)]
-        ws.set_column(0, len(ch["G"].columns)+len(ch["F"].columns)+2, 22)
-        base = max(len(ch["G"]),len(ch["F"]))+4
-        for i,(label,val) in enumerate(cg.items()):
-            ws.write(base+i,0,label,gf); ws.write(base+i,1,val)
-        for i,(label,val) in enumerate(cf.items()):
-            ws.write(base+i,len(ch["G"].columns)+2,label,ff); ws.write(base+i,len(ch["G"].columns)+3,val)
-        add_roc(wb, ws, fprg, tprg, fprf, tprf, cg, cf, cv["G"], cv["F"], z)
+    channels = autodetect_channels(filepath)
+    dfs = load_and_clean_data(filepath, channels)
+    cvs = extract_cv(filepath, channels)
+
+    classified = {name: classify(dfs[name], cvs[name], z) for name, *_ in channels}
+    counts = {name: count(classified[name], name) for name in classified}
+    rocs = {name: roc_curve(classified[name]["True Label"], classified[name]["Intensity (cps)"])[:2] for name in classified}
+
+    output_path = os.path.join(OUTPUT_FOLDER, os.path.basename(filepath).replace('.xlsx', '_results.xlsx'))
+
+    with pd.ExcelWriter(output_path, engine='xlsxwriter', engine_kwargs={'options':{'nan_inf_to_errors': True}}) as writer:
+        workbook = writer.book
+        worksheet = workbook.add_worksheet("Combined")
+        writer.sheets["Combined"] = worksheet
+
+        offset = 0
+        for name in classified:
+            worksheet.write(0, offset, name)
+            for col_num, col_name in enumerate(classified[name].columns):
+                worksheet.write(1, offset + col_num, col_name)
+            for r, row in classified[name].iterrows():
+                for c, v in enumerate(row):
+                    if pd.isna(v) or v in [float('inf'), float('-inf')]:
+                        worksheet.write(r+2, offset+c, "")
+                    else:
+                        worksheet.write(r+2, offset+c, v)
+            offset += len(classified[name].columns) + 2
+
+        add_roc(workbook, worksheet, rocs, counts, cvs, z, list(classified.keys()))
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    z = 100  # Set for your test
+    z = 1.1
     for file in os.listdir(INPUT_FOLDER):
         if file.endswith(".xlsx") and not file.startswith("~$"):
             print(f"Processing {file}...")
-            process_file(os.path.join(INPUT_FOLDER, file), z=z)
+            try:
+                process_file(os.path.join(INPUT_FOLDER, file), z=z)
+                print(f"Successfully processed {file}")
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
 
 if __name__ == "__main__":
     main()
