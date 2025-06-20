@@ -7,13 +7,19 @@ INPUT_FOLDER, OUTPUT_FOLDER = "input", "output"
 
 def load_and_clean_data(filepath):
     # Returns a dict: {"G": df, "F": df}
-    def read(cols, skips): return pd.read_excel(filepath, skiprows=skips, nrows=52, usecols=cols, names=["Sample ID", "Concentration (ng)", "Intensity (cps)", "Mass (m/z)", "Mass 15 Intensity (cps)", "Mass 18 Intensity (cps)", "Mass 18 Ratio"])
+    def read(cols, skips): 
+        return pd.read_excel(filepath, skiprows=skips, nrows=52, usecols=cols, 
+            names=["Sample ID", "Concentration (ng)", "Intensity (cps)", "Mass (m/z)", 
+                   "Mass 15 Intensity (cps)", "Mass 18 Intensity (cps)", "Mass 18 Ratio"])
     dfg = read("A:G", [0,4])
     dff = read("A,H:M", [0,1])
     for df in [dfg, dff]:
         df["Concentration (ng)"] = pd.to_numeric(df["Concentration (ng)"], errors="coerce")
         df["Intensity (cps)"] = pd.to_numeric(df["Intensity (cps)"], errors="coerce")
-    return { "G": dfg.dropna().iloc[1:].reset_index(drop=True), "F": dff.dropna().iloc[1:].reset_index(drop=True) }
+    return { 
+        "G": dfg.dropna().iloc[1:].reset_index(drop=True), 
+        "F": dff.dropna().iloc[1:].reset_index(drop=True) 
+    }
 
 def extract_cv(filepath): 
     s = pd.read_excel(filepath, sheet_name="Sheet1", header=None)
@@ -31,7 +37,9 @@ def classify(df, cv, z):
     df["Above Threshold"] = df["Classification"].isin(["True Positive","False Positive"]).astype(int)
     return df
 
-def count(df, p): v = df['Classification'].value_counts(); return {f"{p} {k}":v.get(k,0) for k in ["True Positive","False Positive","False Negative","True Negative"]}
+def count(df, p): 
+    v = df['Classification'].value_counts()
+    return {f"{p} {k}":v.get(k,0) for k in ["True Positive","False Positive","False Negative","True Negative"]}
 
 def add_roc(workbook, worksheet, fprg, tprg, fprf, tprf, cg, cf, cvg, cvf, z):
     sheet = workbook.add_worksheet("ROC Data")
@@ -59,7 +67,9 @@ def process_file(filepath, z):
     cg, cf = count(ch["G"],"G"), count(ch["F"],"F")
     fprg, tprg, _ = roc_curve(ch["G"]["True Label"], ch["G"]["Intensity (cps)"])
     fprf, tprf, _ = roc_curve(ch["F"]["True Label"], ch["F"]["Intensity (cps)"])
-    fn = os.path.splitext(os.path.basename(filepath))[0]+"_results.xlsx"; out = os.path.join(OUTPUT_FOLDER, fn)
+    # Output filename includes the Z value!
+    fn = os.path.splitext(os.path.basename(filepath))[0]+f"_z{z}_results.xlsx"
+    out = os.path.join(OUTPUT_FOLDER, fn)
     with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
         wb = writer.book; ws = wb.add_worksheet("Combined"); writer.sheets['Combined'] = ws
         gf, ff = wb.add_format({'bold':True,'bg_color':'#D9E1F2'}), wb.add_format({'bold':True,'bg_color':'#FCE4D6'})
@@ -78,10 +88,14 @@ def process_file(filepath, z):
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    z = 100  # Set for your test
+    try:
+        z = float(input("Enter the Z value (for example, 1.1): "))
+    except Exception:
+        print("Invalid value for Z. Using default Z=1.1")
+        z = 1.1
     for file in os.listdir(INPUT_FOLDER):
         if file.endswith(".xlsx") and not file.startswith("~$"):
-            print(f"Processing {file}...")
+            print(f"Processing {file} with Z={z}...")
             process_file(os.path.join(INPUT_FOLDER, file), z=z)
 
 if __name__ == "__main__":
