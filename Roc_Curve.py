@@ -29,8 +29,8 @@ def classify(df, cv, z):
     t = cv*z
     def lab(row):
         if row["Concentration (ng)"] != 0:
-            return "True Positive" if row["Intensity (cps)"] > t else "False Negative"
-        return "False Positive" if row["Intensity (cps)"] > t else "True Negative"
+            return "True Positive" if row["Intensity (cps)"] < t else "False Negative"
+        return "False Positive" if row["Intensity (cps)"] < t else "True Negative"
     df = df.copy()
     df["Classification"] = df.apply(lab, axis=1)
     df["True Label"] = df["Classification"].isin(["True Positive","False Negative"]).astype(int)
