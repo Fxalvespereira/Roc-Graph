@@ -51,10 +51,7 @@ def robust_confusion_matrix(y_true, y_pred):
         tn = fp = fn = tp = 0
     return tn, fp, fn, tp
 
-def optimize_z_for_balanced_true_and_false(sub, z_range, z_ref=5.5):
-    best_z = None
-    best_stats = None
-
+def optimize_z_min_fp(sub, z_range, z_ref=5.5):
     concentration_col = [col for col in sub.columns if 'Concentration' in col][0]
     intensity_col = [col for col in sub.columns if 'Intensity' in col][0]
     cv = sub['critical_value'].iloc[0]
@@ -77,40 +74,19 @@ def optimize_z_for_balanced_true_and_false(sub, z_range, z_ref=5.5):
         f1 = (2 * precision * recall) / (precision + recall) if (precision is not None and recall is not None and (precision + recall) > 0) else None
         z_candidates.append((z, tp, tn, fp, fn, acc, recall, specificity, precision, f1))
 
-    # Filter for 100% accuracy AND at least one TP and one TN (i.e., not all-positive or all-negative)
-    perfects = [
-        c for c in z_candidates
-        if c[5] is not None and abs(c[5] - 1.0) < 1e-10 and c[1] > 0 and c[2] > 0
-    ]
-    if perfects:
-        min_fn = min(c[4] for c in perfects)
-        filtered = [c for c in perfects if c[4] == min_fn]
-        best = max(filtered, key=lambda x: (x[1]+x[2], -abs(x[0]-z_ref)))
-        best_z, tp, tn, fp, fn, acc, recall, specificity, precision, f1 = best
-        return best_z, fn, (tp, tn, fp, fn, acc, recall, specificity, precision, f1)
-    # Otherwise: minimize FN, then maximize TP+TN, then closest to z_ref
-    min_fn = min(c[4] for c in z_candidates)
-    filtered = [c for c in z_candidates if c[4] == min_fn]
-    best = max(filtered, key=lambda x: (x[1]+x[2], -abs(x[0]-z_ref)))
+    # 1. Minimize FP
+    min_fp = min(c[3] for c in z_candidates)
+    fp_candidates = [c for c in z_candidates if c[3] == min_fp]
+    # 2. Minimize FN
+    min_fn = min(c[4] for c in fp_candidates)
+    fn_candidates = [c for c in fp_candidates if c[4] == min_fn]
+    # 3. Maximize accuracy
+    max_acc = max(c[5] for c in fn_candidates if c[5] is not None)
+    acc_candidates = [c for c in fn_candidates if c[5] == max_acc]
+    # 4. Closest to z_ref
+    best = min(acc_candidates, key=lambda x: abs(x[0] - z_ref))
     best_z, tp, tn, fp, fn, acc, recall, specificity, precision, f1 = best
     return best_z, fn, (tp, tn, fp, fn, acc, recall, specificity, precision, f1)
-
-
-def filter_unique_roc_points(sub, z_candidates):
-    concentration_col = [col for col in sub.columns if 'Concentration' in col][0]
-    intensity_col = [col for col in sub.columns if 'Intensity' in col][0]
-    cv = sub['critical_value'].iloc[0]
-    y_score = sub[intensity_col]
-    y_true = (sub[concentration_col] != 0).astype(int)
-    seen = set()
-    filtered_zs = []
-    for z in sorted(z_candidates):
-        threshold = cv * z
-        preds = tuple((y_score > threshold).astype(int))
-        if preds not in seen:
-            filtered_zs.append(z)
-            seen.add(preds)
-    return filtered_zs
 
 def process_compound_excels(input_folder='input', output_folder='output', z_value=5.5):
     os.makedirs(output_folder, exist_ok=True)
@@ -182,9 +158,8 @@ def save_analysis_excel(input_csv, output_excel, z_list, z_input=5.5):
             intensity_col = [col for col in sub.columns if 'Intensity' in col][0]
             y_true = (sub[concentration_col] != 0).astype(int)
             y_score = sub[intensity_col]
-            # Use ALL z's, not just unique prediction z's
             filtered_zs = list(z_list)
-            best_z, min_fn, stats = optimize_z_for_balanced_true_and_false(sub, filtered_zs, z_input)
+            best_z, fn, stats = optimize_z_min_fp(sub, filtered_zs, z_input)
             tp, tn, fp, fn, acc, recall, specificity, precision, f1 = stats
             full_z_list = sorted(set(filtered_zs + [best_z, z_input]))
             if len(y_true) == 0 or len(np.unique(y_true)) < 2:
