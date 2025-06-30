@@ -62,7 +62,6 @@ def optimize_z_for_balanced_true_and_false(sub, z_range, z_ref=5.5):
     y_score = sub[intensity_col]
 
     z_candidates = []
-    # Collect all possible stats for all z's
     for z in z_range:
         threshold = cv * z
         preds = (y_score > threshold).astype(int)
@@ -78,10 +77,12 @@ def optimize_z_for_balanced_true_and_false(sub, z_range, z_ref=5.5):
         f1 = (2 * precision * recall) / (precision + recall) if (precision is not None and recall is not None and (precision + recall) > 0) else None
         z_candidates.append((z, tp, tn, fp, fn, acc, recall, specificity, precision, f1))
 
-    # First: look for 100% accuracy
-    perfects = [c for c in z_candidates if c[5] is not None and abs(c[5] - 1.0) < 1e-10]
+    # Filter for 100% accuracy AND at least one TP and one TN (i.e., not all-positive or all-negative)
+    perfects = [
+        c for c in z_candidates
+        if c[5] is not None and abs(c[5] - 1.0) < 1e-10 and c[1] > 0 and c[2] > 0
+    ]
     if perfects:
-        # Among these, pick with min FN, then max (TP+TN), then closest to z_ref
         min_fn = min(c[4] for c in perfects)
         filtered = [c for c in perfects if c[4] == min_fn]
         best = max(filtered, key=lambda x: (x[1]+x[2], -abs(x[0]-z_ref)))
@@ -93,6 +94,7 @@ def optimize_z_for_balanced_true_and_false(sub, z_range, z_ref=5.5):
     best = max(filtered, key=lambda x: (x[1]+x[2], -abs(x[0]-z_ref)))
     best_z, tp, tn, fp, fn, acc, recall, specificity, precision, f1 = best
     return best_z, fn, (tp, tn, fp, fn, acc, recall, specificity, precision, f1)
+
 
 def filter_unique_roc_points(sub, z_candidates):
     concentration_col = [col for col in sub.columns if 'Concentration' in col][0]
