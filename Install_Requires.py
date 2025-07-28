@@ -8,7 +8,8 @@ required_packages = [
     "pandas",
     "scikit-learn",
     "XlsxWriter",
-    "openpyxl"
+    "openpyxl",
+    "matplotlib"
 ]
 
 for pkg in required_packages:
