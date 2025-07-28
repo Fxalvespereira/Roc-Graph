@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
-from sklearn.metrics import auc, roc_curve
+from sklearn.metrics import auc
 import matplotlib.pyplot as plt
 import xlsxwriter
 
@@ -60,12 +60,31 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
     df = pd.read_csv(input_csv)
     compounds = df['compound_id'].unique()
 
+    # Calculate optimal crit for display (use best for whole df)
+    best_acc, best_crit = -1, None
+    all_crits = np.sort(np.unique(np.concatenate([df[[c for c in df.columns if 'Intensity' in c][0]].values, crit_values])))
+    for crit in all_crits:
+        classified = classify(df.copy(), crit)
+        tp = len(classified[classified["Classification"] == "True Positive"])
+        tn = len(classified[classified["Classification"] == "True Negative"])
+        fp = len(classified[classified["Classification"] == "False Positive"])
+        fn = len(classified[classified["Classification"] == "False Negative"])
+        total = tp + tn + fp + fn
+        acc = (tp + tn) / total if total > 0 else 0
+        if acc > best_acc:
+            best_acc, best_crit = acc, crit
+    df = classify(df, best_crit)
+
+    # Remove 'threshold' and 'Classification' columns from Data tab
+    data_for_excel = df.drop(columns=["threshold", "Classification"], errors="ignore")
+
     with pd.ExcelWriter(output_excel, engine='xlsxwriter') as writer:
-        df.to_excel(writer, sheet_name='Data', index=False)
+        data_for_excel.to_excel(writer, sheet_name='Data', index=False)
         summary_rows = []
 
         roc_ws = writer.book.add_worksheet('ROC_Curves')
-        chart = writer.book.add_chart({'type': 'scatter', 'subtype': 'smooth'})
+        chart = writer.book.add_chart({'type': 'scatter'})
+        chart_smooth = writer.book.add_chart({'type': 'scatter', 'subtype': 'smooth'})
         row_cursor = 0
 
         for compound in compounds:
@@ -73,74 +92,90 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
             y_true = (sub[[c for c in sub.columns if 'Concentration' in c][0]] != 0).astype(int)
             y_score = sub[[c for c in sub.columns if 'Intensity' in c][0]]
 
-            # Use all unique observed intensities AND crit values from txt
-            sweep_crits = np.sort(np.unique(np.concatenate([y_score.values, crit_values])))
-
-            fpr, tpr, crits = [], [], []
-            best_acc, best_crit = -1, None
-            for crit in sweep_crits:
+            # --- Non-smoothed: Only crit_values from txt ---
+            sweep_crits_nonsmooth = np.sort(np.unique(crit_values))
+            fpr_ns, tpr_ns, crits_ns = [], [], []
+            for crit in sweep_crits_nonsmooth:
                 classified = classify(sub.copy(), crit)
                 tp = len(classified[classified["Classification"] == "True Positive"])
                 tn = len(classified[classified["Classification"] == "True Negative"])
                 fp = len(classified[classified["Classification"] == "False Positive"])
                 fn = len(classified[classified["Classification"] == "False Negative"])
-                total = tp + tn + fp + fn
-                acc = (tp + tn) / total if total > 0 else 0
-                if acc > best_acc:
-                    best_acc, best_crit = acc, crit
-
                 if (fp + tn) == 0 or (tp + fn) == 0:
                     continue
-                fpr.append(fp / (fp + tn))
-                tpr.append(tp / (tp + fn))
-                crits.append(crit)
+                fpr_ns.append(fp / (fp + tn))
+                tpr_ns.append(tp / (tp + fn))
+                crits_ns.append(crit)
+            auc_ns = auc(fpr_ns, tpr_ns) if len(fpr_ns) > 1 else float('nan')
 
-            if len(fpr) < 2:
-                continue
+            # --- Smoothed: Crit values + all unique intensities ---
+            sweep_crits_smooth = np.sort(np.unique(np.concatenate([y_score.values, crit_values])))
+            fpr_sm, tpr_sm, crits_sm = [], [], []
+            for crit in sweep_crits_smooth:
+                classified = classify(sub.copy(), crit)
+                tp = len(classified[classified["Classification"] == "True Positive"])
+                tn = len(classified[classified["Classification"] == "True Negative"])
+                fp = len(classified[classified["Classification"] == "False Positive"])
+                fn = len(classified[classified["Classification"] == "False Negative"])
+                if (fp + tn) == 0 or (tp + fn) == 0:
+                    continue
+                fpr_sm.append(fp / (fp + tn))
+                tpr_sm.append(tp / (tp + fn))
+                crits_sm.append(crit)
+            auc_sm = auc(fpr_sm, tpr_sm) if len(fpr_sm) > 1 else float('nan')
 
-            sorted_pairs = sorted(zip(fpr, tpr, crits))
-            fpr_sorted, tpr_sorted, crits_sorted = zip(*sorted_pairs)
-            auc_val = auc(fpr_sorted, tpr_sorted)
-
-            roc_ws.write(row_cursor, 0, f"{compound} ROC (AUC={auc_val:.3f})")
+            # --- Write Non-smoothed table ---
+            roc_ws.write(row_cursor, 0, f"{compound} ROC (AUC Crits Only={auc_ns:.3f})")
             roc_ws.write_row(row_cursor+1, 0, ['FPR', 'TPR', 'Crit_Value'])
-            for idx, data in enumerate(zip(fpr_sorted, tpr_sorted, crits_sorted)):
+            for idx, data in enumerate(zip(fpr_ns, tpr_ns, crits_ns)):
                 roc_ws.write_row(row_cursor+2+idx, 0, data)
-
             chart.add_series({
-                'name': compound,
-                'categories': ['ROC_Curves', row_cursor+2, 0, row_cursor+1+len(fpr_sorted), 0],
-                'values': ['ROC_Curves', row_cursor+2, 1, row_cursor+1+len(tpr_sorted), 1],
+                'name': f'{compound} Crits Only',
+                'categories': ['ROC_Curves', row_cursor+2, 0, row_cursor+1+len(fpr_ns), 0],
+                'values': ['ROC_Curves', row_cursor+2, 1, row_cursor+1+len(tpr_ns), 1],
+                'marker': {'type': 'diamond', 'size': 7},
+                'line': {'none': True},
+            })
+
+            row_cursor_smooth = row_cursor + 2 + len(fpr_ns) + 1
+            # --- Write Smoothed table ---
+            roc_ws.write(row_cursor_smooth, 0, f"{compound} ROC (AUC Crits+All Unique={auc_sm:.3f})")
+            roc_ws.write_row(row_cursor_smooth+1, 0, ['FPR', 'TPR', 'Crit_Value'])
+            for idx, data in enumerate(zip(fpr_sm, tpr_sm, crits_sm)):
+                roc_ws.write_row(row_cursor_smooth+2+idx, 0, data)
+            chart_smooth.add_series({
+                'name': f'{compound} Crits+All Unique',
+                'categories': ['ROC_Curves', row_cursor_smooth+2, 0, row_cursor_smooth+1+len(fpr_sm), 0],
+                'values': ['ROC_Curves', row_cursor_smooth+2, 1, row_cursor_smooth+1+len(tpr_sm), 1],
                 'marker': {'type': 'circle', 'size': 5},
                 'line': {'width': 2},
             })
 
-            row_cursor += len(fpr_sorted) + 4
-            summary_rows.append({"Compound": compound, "Best_Crit": best_crit, "Accuracy": best_acc})
+            # Move cursor for next compound
+            row_cursor = row_cursor_smooth + 2 + len(fpr_sm) + 2
 
-        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Optimal_Crit_Summary", index=False)
+            # Save summary info (could use either smooth or non-smooth)
+            summary_rows.append({"Compound": compound, "AUC_CritsOnly": auc_ns, "AUC_CritsAllUnique": auc_sm})
 
-        # Add 50% accuracy (chance) diagonal line
-        roc_ws.write(row_cursor, 0, "FPR_Chance")
-        roc_ws.write(row_cursor, 1, "TPR_Chance")
-        roc_ws.write(row_cursor+1, 0, 0)
-        roc_ws.write(row_cursor+1, 1, 0)
-        roc_ws.write(row_cursor+2, 0, 1)
-        roc_ws.write(row_cursor+2, 1, 1)
-        chart.add_series({
-            'name': '50% Accuracy (Chance)',
-            'categories': ['ROC_Curves', row_cursor+1, 0, row_cursor+2, 0],
-            'values':     ['ROC_Curves', row_cursor+1, 1, row_cursor+2, 1],
-            'marker': {'type': 'none'},
-            'line': {'color': 'gray', 'dash_type': 'dash', 'width': 1.5},
-        })
+        pd.DataFrame(summary_rows).to_excel(writer, sheet_name="AUC_Summary", index=False)
 
-        chart.set_title({'name': 'ROC Curves per Compound'})
-        chart.set_x_axis({'name': 'False Positive Rate', 'min': 0, 'max': 1, 'major_gridlines': {'visible': True}})
-        chart.set_y_axis({'name': 'True Positive Rate', 'min': 0, 'max': 1, 'major_gridlines': {'visible': True}})
-        chart.set_legend({'position': 'bottom'})
+        # Add 50% chance line to both charts
+        for c in [chart, chart_smooth]:
+            c.add_series({
+                'name': 'Chance',
+                'categories': ['ROC_Curves', 1, 0, 2, 0],
+                'values':     ['ROC_Curves', 1, 1, 2, 1],
+                'marker': {'type': 'none'},
+                'line': {'color': 'gray', 'dash_type': 'dash', 'width': 1.5},
+            })
+            c.set_x_axis({'name': 'False Positive Rate', 'min': 0, 'max': 1, 'major_gridlines': {'visible': True}})
+            c.set_y_axis({'name': 'True Positive Rate', 'min': 0, 'max': 1, 'major_gridlines': {'visible': True}})
+            c.set_legend({'position': 'bottom'})
 
-        roc_ws.insert_chart('E2', chart, {'x_scale': 2, 'y_scale': 2})
+        chart.set_title({'name': 'ROC Curve Using Given Threshold Values'})
+        chart_smooth.set_title({'name': 'ROC Curve Using All Possible Thresholds'})
+        roc_ws.insert_chart('M2', chart, {'x_scale': 1.3, 'y_scale': 1.3})
+        roc_ws.insert_chart('M22', chart_smooth, {'x_scale': 1.3, 'y_scale': 1.3})
 
 def plot_and_save_roc_png(input_csv, output_png, crit_values):
     df = pd.read_csv(input_csv)
@@ -150,11 +185,12 @@ def plot_and_save_roc_png(input_csv, output_png, crit_values):
     for compound in compounds:
         sub = df[df['compound_id'] == compound]
         y_true = (sub[[c for c in sub.columns if 'Concentration' in c][0]] != 0).astype(int)
+        pos = sum(y_true == 1)
+        neg = sum(y_true == 0)
+        print(f"Plotting {compound}: Pos={pos}, Neg={neg}, Total={len(y_true)}")  # <-- DEBUG OUTPUT
         y_score = sub[[c for c in sub.columns if 'Intensity' in c][0]]
-
-        # Use all unique observed intensities AND crit values from txt
+        # Use crit values and all unique intensities:
         sweep_crits = np.sort(np.unique(np.concatenate([y_score.values, crit_values])))
-
         tpr = []
         fpr = []
         for crit in sweep_crits:
@@ -168,6 +204,7 @@ def plot_and_save_roc_png(input_csv, output_png, crit_values):
             fpr.append(fp / (fp + tn))
             tpr.append(tp / (tp + fn))
         if len(fpr) < 2:
+            print(f"Skipping {compound}: Not enough ROC points.")
             continue
         roc_auc = auc(fpr, tpr)
         plt.plot(fpr, tpr, label=f'{compound} (AUC = {roc_auc:.3f})')
