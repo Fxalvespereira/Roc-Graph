@@ -5,14 +5,17 @@ from sklearn.metrics import auc
 import matplotlib.pyplot as plt
 import xlsxwriter
 
-def load_crit_values_from_txt(script_dir):
-    filepath = os.path.join(script_dir, 'crit_values.txt')
-    if not os.path.exists(filepath):
-        print("crit_values.txt not found, only using unique intensities.")
-        return np.array([])
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
-    return np.array([float(line.strip()) for line in lines if line.strip() and not line.lower().startswith('crit')])
+def load_individual_crit_values(script_dir, max_compounds=4):
+    crit_values = []
+    for i in range(1, max_compounds+1):
+        filename = os.path.join(script_dir, f'crit_values {i}.txt')
+        if os.path.exists(filename):
+            with open(filename, 'r') as f:
+                lines = [float(line.strip()) for line in f if line.strip() and 'crit' not in line.lower()]
+            crit_values.append(np.array(lines))
+        else:
+            crit_values.append(np.array([]))
+    return crit_values
 
 def classify(df, crit_value):
     concentration_col = [col for col in df.columns if 'Concentration' in col][0]
@@ -56,43 +59,55 @@ def process_compound_excels(input_folder, output_folder):
             processed_files.append(out_csv)
     return processed_files
 
-def save_analysis_excel(input_csv, output_excel, crit_values):
+def save_analysis_excel(input_csv, output_excel, crit_values_list):
     df = pd.read_csv(input_csv)
     compounds = df['compound_id'].unique()
 
-    # Calculate optimal crit for display (use best for whole df)
-    best_acc, best_crit = -1, None
-    all_crits = np.sort(np.unique(np.concatenate([df[[c for c in df.columns if 'Intensity' in c][0]].values, crit_values])))
-    for crit in all_crits:
-        classified = classify(df.copy(), crit)
-        tp = len(classified[classified["Classification"] == "True Positive"])
-        tn = len(classified[classified["Classification"] == "True Negative"])
-        fp = len(classified[classified["Classification"] == "False Positive"])
-        fn = len(classified[classified["Classification"] == "False Negative"])
-        total = tp + tn + fp + fn
-        acc = (tp + tn) / total if total > 0 else 0
-        if acc > best_acc:
-            best_acc, best_crit = acc, crit
-    df = classify(df, best_crit)
-
-    # Remove 'threshold' and 'Classification' columns from Data tab
-    data_for_excel = df.drop(columns=["threshold", "Classification"], errors="ignore")
+    # For the Data tab, do not add classification/threshold columns
+    data_for_excel = df.copy()
 
     with pd.ExcelWriter(output_excel, engine='xlsxwriter') as writer:
         data_for_excel.to_excel(writer, sheet_name='Data', index=False)
         summary_rows = []
+
+        # --- Confusion Matrices Sheet ---
+        conf_ws = writer.book.add_worksheet('Confusion_Matrices')
+        conf_row = 0
+        for idx, compound in enumerate(compounds):
+            sub = df[df['compound_id'] == compound]
+            y_true = (sub[[c for c in sub.columns if 'Concentration' in c][0]] != 0).astype(int)
+            y_score = sub[[c for c in sub.columns if 'Intensity' in c][0]]
+            crit_values = crit_values_list[idx] if idx < len(crit_values_list) else np.array([])
+
+            conf_ws.write(conf_row, 0, f"Compound: {compound}")
+            conf_row += 1
+            conf_ws.write_row(conf_row, 1, ['Threshold', 'TP', 'FN', 'FP', 'TN'])
+            conf_row += 1
+
+            for crit in crit_values:
+                classified = classify(sub.copy(), crit)
+                tp = len(classified[classified["Classification"] == "True Positive"])
+                fn = len(classified[classified["Classification"] == "False Negative"])
+                fp = len(classified[classified["Classification"] == "False Positive"])
+                tn = len(classified[classified["Classification"] == "True Negative"])
+                conf_ws.write_row(conf_row, 1, [crit, tp, fn, fp, tn])
+                conf_row += 1
+
+            conf_row += 2  # Space between compounds
 
         roc_ws = writer.book.add_worksheet('ROC_Curves')
         chart = writer.book.add_chart({'type': 'scatter'})
         chart_smooth = writer.book.add_chart({'type': 'scatter', 'subtype': 'smooth'})
         row_cursor = 0
 
-        for compound in compounds:
+        for idx, compound in enumerate(compounds):
             sub = df[df['compound_id'] == compound]
             y_true = (sub[[c for c in sub.columns if 'Concentration' in c][0]] != 0).astype(int)
             y_score = sub[[c for c in sub.columns if 'Intensity' in c][0]]
 
-            # --- Non-smoothed: Only crit_values from txt ---
+            crit_values = crit_values_list[idx] if idx < len(crit_values_list) else np.array([])
+
+            # --- Non-smoothed: Only crit_values for this compound ---
             sweep_crits_nonsmooth = np.sort(np.unique(crit_values))
             fpr_ns, tpr_ns, crits_ns = [], [], []
             for crit in sweep_crits_nonsmooth:
@@ -108,7 +123,7 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
                 crits_ns.append(crit)
             auc_ns = auc(fpr_ns, tpr_ns) if len(fpr_ns) > 1 else float('nan')
 
-            # --- Smoothed: Crit values + all unique intensities ---
+            # --- Smoothed: Crit values + all unique intensities for this compound ---
             sweep_crits_smooth = np.sort(np.unique(np.concatenate([y_score.values, crit_values])))
             fpr_sm, tpr_sm, crits_sm = [], [], []
             for crit in sweep_crits_smooth:
@@ -127,8 +142,8 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
             # --- Write Non-smoothed table ---
             roc_ws.write(row_cursor, 0, f"{compound} ROC (AUC Crits Only={auc_ns:.3f})")
             roc_ws.write_row(row_cursor+1, 0, ['FPR', 'TPR', 'Crit_Value'])
-            for idx, data in enumerate(zip(fpr_ns, tpr_ns, crits_ns)):
-                roc_ws.write_row(row_cursor+2+idx, 0, data)
+            for i, data in enumerate(zip(fpr_ns, tpr_ns, crits_ns)):
+                roc_ws.write_row(row_cursor+2+i, 0, data)
             chart.add_series({
                 'name': f'{compound} Crits Only',
                 'categories': ['ROC_Curves', row_cursor+2, 0, row_cursor+1+len(fpr_ns), 0],
@@ -141,8 +156,8 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
             # --- Write Smoothed table ---
             roc_ws.write(row_cursor_smooth, 0, f"{compound} ROC (AUC Crits+All Unique={auc_sm:.3f})")
             roc_ws.write_row(row_cursor_smooth+1, 0, ['FPR', 'TPR', 'Crit_Value'])
-            for idx, data in enumerate(zip(fpr_sm, tpr_sm, crits_sm)):
-                roc_ws.write_row(row_cursor_smooth+2+idx, 0, data)
+            for i, data in enumerate(zip(fpr_sm, tpr_sm, crits_sm)):
+                roc_ws.write_row(row_cursor_smooth+2+i, 0, data)
             chart_smooth.add_series({
                 'name': f'{compound} Crits+All Unique',
                 'categories': ['ROC_Curves', row_cursor_smooth+2, 0, row_cursor_smooth+1+len(fpr_sm), 0],
@@ -154,7 +169,6 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
             # Move cursor for next compound
             row_cursor = row_cursor_smooth + 2 + len(fpr_sm) + 2
 
-            # Save summary info (could use either smooth or non-smooth)
             summary_rows.append({"Compound": compound, "AUC_CritsOnly": auc_ns, "AUC_CritsAllUnique": auc_sm})
 
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="AUC_Summary", index=False)
@@ -177,69 +191,19 @@ def save_analysis_excel(input_csv, output_excel, crit_values):
         roc_ws.insert_chart('M2', chart, {'x_scale': 1.3, 'y_scale': 1.3})
         roc_ws.insert_chart('M22', chart_smooth, {'x_scale': 1.3, 'y_scale': 1.3})
 
-def plot_and_save_roc_png(input_csv, output_png, crit_values):
-    df = pd.read_csv(input_csv)
-    compounds = df['compound_id'].unique()
-    plt.figure(figsize=(7, 7))
-    found_data = False
-    for compound in compounds:
-        sub = df[df['compound_id'] == compound]
-        y_true = (sub[[c for c in sub.columns if 'Concentration' in c][0]] != 0).astype(int)
-        pos = sum(y_true == 1)
-        neg = sum(y_true == 0)
-        print(f"Plotting {compound}: Pos={pos}, Neg={neg}, Total={len(y_true)}")  # <-- DEBUG OUTPUT
-        y_score = sub[[c for c in sub.columns if 'Intensity' in c][0]]
-        # Use crit values and all unique intensities:
-        sweep_crits = np.sort(np.unique(np.concatenate([y_score.values, crit_values])))
-        tpr = []
-        fpr = []
-        for crit in sweep_crits:
-            preds = (y_score > crit).astype(int)
-            tn = ((preds == 0) & (y_true == 0)).sum()
-            fp = ((preds == 1) & (y_true == 0)).sum()
-            fn = ((preds == 0) & (y_true == 1)).sum()
-            tp = ((preds == 1) & (y_true == 1)).sum()
-            if (fp + tn) == 0 or (tp + fn) == 0:
-                continue
-            fpr.append(fp / (fp + tn))
-            tpr.append(tp / (tp + fn))
-        if len(fpr) < 2:
-            print(f"Skipping {compound}: Not enough ROC points.")
-            continue
-        roc_auc = auc(fpr, tpr)
-        plt.plot(fpr, tpr, label=f'{compound} (AUC = {roc_auc:.3f})')
-        found_data = True
-    if not found_data:
-        print(f"No valid ROC curve data for: {os.path.basename(input_csv)}")
-        plt.close()
-        return
-    plt.plot([0, 1], [0, 1], 'k--', label='Chance (AUC = 0.5)')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.0])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('ROC Curve(s) per Compound')
-    plt.legend(loc='lower right')
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=200)
-    plt.close()
-    print(f"ROC curve PNG saved to: {output_png}")
-
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     input_folder = os.path.join(script_dir, "input")
     output_folder = os.path.join(script_dir, "output")
     os.makedirs(output_folder, exist_ok=True)
 
-    crit_values = load_crit_values_from_txt(script_dir)
+    crit_values_list = load_individual_crit_values(script_dir)
 
     processed_files = process_compound_excels(input_folder, output_folder)
     for csv_path in processed_files:
-        excel_path = csv_path.replace('.csv', '_crit_analysis.xlsx')
-        save_analysis_excel(csv_path, excel_path, crit_values)
+        excel_path = csv_path.replace('.csv', '_analysis.xlsx')
+        save_analysis_excel(csv_path, excel_path, crit_values_list)
         print(f"Analysis complete for: {os.path.basename(csv_path)}")
-        output_png = excel_path.replace('_crit_analysis.xlsx', '_ROC.png')
-        plot_and_save_roc_png(csv_path, output_png, crit_values)
 
 if __name__ == "__main__":
     main()
